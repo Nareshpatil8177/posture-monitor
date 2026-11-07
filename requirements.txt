@@ -1,0 +1,5 @@
+# mediapipe 0.10.21 is the last line I verified that still ships the legacy
+# `mp.solutions.pose` API (bundled model, no separate download). Newer
+# releases (0.10.3x) removed it. It also pulls in opencv + numpy.
+mediapipe==0.10.21
+numpy>=1.26,<2
