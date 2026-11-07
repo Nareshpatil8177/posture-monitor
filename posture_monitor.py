@@ -29,9 +29,11 @@ class Features:
     """All three are dimensionless / angular, so they do not change when the
     person sits closer to the camera.
 
-    tilt_deg   : shoulder-line roll from horizontal, degrees (0 = level)
-    lateral    : |ear-midpoint x - shoulder-midpoint x| / shoulder width
+    tilt_deg   : SIGNED shoulder-line roll from horizontal, degrees
+    lateral    : SIGNED (ear-midpoint x - shoulder-midpoint x) / shoulder width
                  (head sliding/leaning sideways relative to the torso)
+    Tilt and lateral are signed so a personal baseline can be subtracted:
+    most people are a few degrees asymmetric even when sitting well.
     neck_ratio : distance(ear-mid, shoulder-mid) / shoulder width
                  (shrinks when the head drops / sinks into the shoulders)
     """
@@ -56,12 +58,12 @@ def compute_features(lm, w: int, h: int) -> Features | None:
         return None
     # Angle of the shoulder line, folded so left/right labelling doesn't matter.
     ang = math.degrees(math.atan2(lsy - rsy, lsx - rsx))
-    tilt = abs(((ang + 90) % 180) - 90)
+    tilt = ((ang + 90) % 180) - 90      # (-90, 90]; folding makes L/R labelling irrelevant
     smx, smy = (lsx + rsx) / 2, (lsy + rsy) / 2
     emx, emy = (lex + rex) / 2, (ley + rey) / 2
     vals = Features(
         tilt_deg=tilt,
-        lateral=abs(emx - smx) / width,
+        lateral=(emx - smx) / width,
         neck_ratio=math.hypot(emx - smx, emy - smy) / width,
     )
     if not all(math.isfinite(v) for v in vals.__dict__.values()):
@@ -74,7 +76,9 @@ def compute_features(lm, w: int, h: int) -> Features | None:
 # --------------------------------------------------------------------------
 @dataclass
 class Config:
-    # enter-bad / exit-bad (hysteresis: exit is stricter than enter)
+    # enter-bad / exit-bad (hysteresis: exit is stricter than enter).
+    # tilt / lateral are |deviation from your own baseline|; drop is the
+    # fractional shrink of neck_ratio vs baseline.
     tilt_enter: float = 8.0      # degrees
     tilt_exit: float = 5.0
     lateral_enter: float = 0.30  # fraction of shoulder width
@@ -88,11 +92,25 @@ class Config:
     max_gap_s: float = 1.0       # a hole in the data longer than this is "unknown"
 
 
-def naive_is_bad(f: Features, baseline_neck: float, c: Config) -> bool:
+@dataclass
+class Baseline:
+    """Your own upright reference, from the calibration window."""
+    tilt_deg: float = 0.0
+    lateral: float = 0.0
+    neck_ratio: float = 0.6
+
+
+def deviations(f: Features, b: Baseline) -> tuple[float, float, float]:
+    """-> (|tilt dev| deg, |lateral dev|, neck drop fraction; + = head sinking)"""
+    return (abs(f.tilt_deg - b.tilt_deg), abs(f.lateral - b.lateral),
+            1.0 - f.neck_ratio / b.neck_ratio)
+
+
+def naive_is_bad(f: Features, b: Baseline, c: Config) -> bool:
     """Per-frame verdict with a single hard line per metric. Kept for the
-    tests (to quantify flicker) and as the input to the stabiliser."""
-    drop = 1.0 - f.neck_ratio / baseline_neck
-    return f.tilt_deg > c.tilt_enter or f.lateral > c.lateral_enter or drop > c.drop_enter
+    tests (to quantify flicker); the real path goes through Stabiliser."""
+    t, l, d = deviations(f, b)
+    return t > c.tilt_enter or l > c.lateral_enter or d > c.drop_enter
 
 
 # --------------------------------------------------------------------------
@@ -115,8 +133,8 @@ class Stabiliser:
     Smoothing is by seconds, not frames, so webcam fps does not matter.
     """
 
-    def __init__(self, cfg: Config, baseline_neck: float):
-        self.c, self.base = cfg, baseline_neck
+    def __init__(self, cfg: Config, baseline: Baseline):
+        self.c, self.base = cfg, baseline
         self.samples: list[list] = []     # [t, committed_state]
         self._reset()
 
@@ -139,7 +157,7 @@ class Stabiliser:
 
     def _hysteresis(self, tilt, lat, neck) -> bool:
         c = self.c
-        drop = 1.0 - neck / self.base
+        tilt, lat, drop = deviations(Features(tilt, lat, neck), self.base)
         if not self.raw_bad:
             if tilt > c.tilt_enter or lat > c.lateral_enter or drop > c.drop_enter:
                 self.raw_bad = True
@@ -392,17 +410,23 @@ def analyse(args, stop):
 
 
 def calibrate(series, args):
-    """Personal upright baseline = median neck_ratio over the first calib window
-    of valid data. Returns (baseline, info)."""
-    if args.baseline_neck:
-        return args.baseline_neck, {"source": "cli", "baseline_neck_ratio": args.baseline_neck}
+    """Personal upright baseline = medians over the first calib window of valid
+    data. Returns (Baseline, info)."""
     t0 = series[0][0]
-    win = [f.neck_ratio for t, f in series if t - t0 <= args.calib_seconds]
-    med = statistics.median(win)
-    spread = (_pct(win, 90) - _pct(win, 10)) / med
-    return med, {"source": "first_valid_seconds", "window_s": args.calib_seconds,
-                 "frames": len(win), "baseline_neck_ratio": round(med, 4),
-                 "relative_spread_p10_p90": round(spread, 3)}
+    win = [f for t, f in series if t - t0 <= args.calib_seconds]
+    med = lambda k: statistics.median(getattr(f, k) for f in win)
+    base = Baseline(med("tilt_deg"), med("lateral"), med("neck_ratio"))
+    src = "first_valid_seconds"
+    if args.baseline_neck:
+        base.neck_ratio, src = args.baseline_neck, "neck from cli, tilt/lateral from first_valid_seconds"
+    nr = [f.neck_ratio for f in win]
+    spread = (_pct(nr, 90) - _pct(nr, 10)) / base.neck_ratio
+    tilt_sd = statistics.pstdev([f.tilt_deg for f in win]) if len(win) > 1 else 0.0
+    return base, {"source": src, "window_s": args.calib_seconds, "frames": len(win),
+                  "baseline_tilt_deg": round(base.tilt_deg, 2),
+                  "baseline_lateral": round(base.lateral, 4),
+                  "baseline_neck_ratio": round(base.neck_ratio, 4),
+                  "neck_spread_p10_p90": round(spread, 3), "tilt_sd_deg": round(tilt_sd, 2)}
 
 
 def run(args) -> int:
@@ -431,11 +455,9 @@ def run(args) -> int:
     summ = summarise(st.samples, observed, cfg)
 
     warnings = []
-    if calib.get("relative_spread_p10_p90", 0) > 0.15:
-        warnings.append("calibration window was unsteady; baseline may be unreliable")
-    first = series[0][1]
-    if first.tilt_deg > cfg.tilt_enter or first.lateral > cfg.lateral_enter:
-        warnings.append("person was already tilted/leaning at the start; baseline may include bad posture")
+    if calib["neck_spread_p10_p90"] > 0.15 or calib["tilt_sd_deg"] > 3.0:
+        warnings.append("calibration window was unsteady; baseline may be unreliable "
+                        "(person moving, or slouching during calibration)")
     if stats.errors:
         warnings.append(f"{stats.errors} frames raised errors and were skipped")
     if stop["flag"]:

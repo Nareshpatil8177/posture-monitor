@@ -1,7 +1,10 @@
 import random
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from posture_monitor import Config, Features, naive_is_bad, Stabiliser, GOOD, BAD
+from posture_monitor import Config, Features, Baseline, naive_is_bad, Stabiliser, GOOD, BAD
+
+
+BASE = Baseline(0.0, 0.0, 0.60)
 
 
 def synthetic(seconds=40, fps=30, seed=1):
@@ -25,7 +28,7 @@ def test_naive_flickers():
     c = Config()
     flips, prev = 0, None
     for _, f, _ in synthetic():
-        bad = naive_is_bad(f, 0.60, c)
+        bad = naive_is_bad(f, BASE, c)
         if prev is not None and bad != prev:
             flips += 1
         prev = bad
@@ -34,7 +37,7 @@ def test_naive_flickers():
     assert flips > 10
 
 
-def run_stab(series, cfg=None, base=0.60):
+def run_stab(series, cfg=None, base=BASE):
     st = Stabiliser(cfg or Config(), base)
     for t, f, *_ in series:
         st.update(t, f)
@@ -62,6 +65,16 @@ def test_short_blip_is_not_a_break():
     assert transitions(run_stab(s)) == []
 
 
+def test_natural_asymmetry_is_not_slouching():
+    # Someone who sits level-headed but with a steady 9 deg shoulder asymmetry.
+    s = [(i / 30, Features(9.0, 0.10, 0.6)) for i in range(30 * 20)]
+    with_base = run_stab(s, base=Baseline(9.0, 0.10, 0.6))
+    assert all(x[1] == GOOD for x in with_base)
+    # Without baseline subtraction the same person is "bad" the whole time.
+    no_base = run_stab(s, base=Baseline(0.0, 0.0, 0.6))
+    assert all(x[1] == BAD for x in no_base)
+
+
 def test_gap_is_not_bad_posture():
     # 5 s with no detections: nothing may be labelled across the hole.
     s = [(i / 30, Features(2, 0.05, 0.6)) for i in range(30 * 5)]
@@ -72,6 +85,7 @@ def test_gap_is_not_bad_posture():
 
 if __name__ == "__main__":
     for fn in (test_naive_flickers, test_stabilised_single_transition,
-               test_short_blip_is_not_a_break, test_gap_is_not_bad_posture):
+               test_short_blip_is_not_a_break, test_natural_asymmetry_is_not_slouching,
+               test_gap_is_not_bad_posture):
         fn()
     print("all passed")

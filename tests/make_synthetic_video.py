@@ -7,7 +7,7 @@ like a sideways shoulder tilt. A few frames are blacked out to simulate
 dropped/corrupt frames. --zoom != 1 crops/zooms to test scale invariance.
 
     pip install scikit-image   # dev-only, not in requirements.txt
-    python tests/make_synthetic_video.py out.mp4 --seconds 30 --roll 14
+    python tests/make_synthetic_video.py out.mp4 --seconds 30 --roll -14
 """
 import argparse
 import random
@@ -22,7 +22,8 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--seconds", type=int, default=30)
     ap.add_argument("--fps", type=int, default=15)
-    ap.add_argument("--roll", type=float, default=14.0)
+    ap.add_argument("--roll", type=float, default=-14.0,
+                    help="negative adds to the portrait's native tilt (positive cancels it)")
     ap.add_argument("--zoom", type=float, default=1.0)
     ap.add_argument("--black-frames", type=int, default=6)
     a = ap.parse_args()
