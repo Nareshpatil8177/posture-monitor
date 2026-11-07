@@ -222,3 +222,256 @@ def summarise(samples, observed_s, cfg: Config) -> dict:
         "score": round(score),
         "episodes": [{"state": s_, "start_s": r(a), "end_s": r(b)} for s_, a, b in runs],
     }
+
+
+# --------------------------------------------------------------------------
+# Capture + CLI
+# --------------------------------------------------------------------------
+EXIT_OK, EXIT_ERROR, EXIT_NO_SOURCE, EXIT_NO_FRAMES, EXIT_NO_PERSON = 0, 1, 2, 3, 4
+MAX_CONSEC_READ_FAILS = 30
+MIN_SHOULDER_VIS, MIN_EAR_VIS = 0.5, 0.3
+
+
+@dataclass
+class FrameStats:
+    attempted: int = 0
+    read_failed: int = 0     # cap.read() returned nothing
+    corrupt: int = 0         # decoded but unusable (None/empty/wrong shape)
+    errors: int = 0          # exception inside the pose model / feature code
+    no_person: int = 0
+    low_visibility: int = 0
+    valid: int = 0
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="Seated posture monitor")
+    ap.add_argument("--source", default="0", help="camera index or video path (default 0)")
+    ap.add_argument("--duration", type=float, default=60.0, help="seconds of video to analyse")
+    ap.add_argument("--out", default="posture.json")
+    ap.add_argument("--preview", action="store_true", help="optional window; q quits")
+    ap.add_argument("--calib-seconds", type=float, default=8.0,
+                    help="first N seconds of valid data define your personal upright baseline")
+    ap.add_argument("--baseline-neck", type=float, default=None,
+                    help="skip calibration and use this neck_ratio as upright baseline")
+    ap.add_argument("--min-coverage", type=float, default=0.3,
+                    help="fraction of the observed time that must contain a usable person")
+    ap.add_argument("--model-complexity", type=int, choices=(0, 1, 2), default=1)
+    ap.add_argument("--dump-features", metavar="CSV", help="write per-frame features (for threshold review)")
+    return ap.parse_args(argv)
+
+
+def write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(obj, fh, indent=2)
+    os.replace(tmp, path)             # atomic: a retrying pipeline never sees half a file
+
+
+def fail(args, code, reason, stats=None, extra=None):
+    print(f"posture_monitor: FAILED ({reason})", file=sys.stderr)
+    body = {"schema_version": 1, "status": "failed", "reason": reason, "exit_code": code,
+            "source": args.source, "frames": asdict(stats) if stats else None}
+    body.update(extra or {})
+    try:
+        write_json(args.out, body)
+    except OSError as e:
+        print(f"posture_monitor: could not write {args.out}: {e}", file=sys.stderr)
+    return code
+
+
+def capture(args, stop):
+    """Yield (timestamp_s, frame_or_None). None marks a failed/corrupt read.
+    File sources use frame_index/fps as the clock (so analysis can run faster
+    than real time); live cameras use the monotonic wall clock."""
+    import cv2
+    is_cam = args.source.isdigit()
+    cap = cv2.VideoCapture(int(args.source) if is_cam else args.source)
+    if not cap.isOpened():
+        return None
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = fps if fps and fps > 1 and math.isfinite(fps) else 30.0
+    n_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    t0 = time.monotonic()
+
+    def gen():
+        idx = fails = 0
+        try:
+            while not stop["flag"]:
+                ts = (time.monotonic() - t0) if is_cam else idx / fps
+                if ts >= args.duration:
+                    return
+                try:
+                    ok, frame = cap.read()
+                except Exception:
+                    ok, frame = False, None
+                idx += 1
+                if not ok:
+                    fails += 1
+                    if not is_cam and n_frames and idx >= n_frames:
+                        return                     # clean end of file
+                    if fails >= MAX_CONSEC_READ_FAILS:
+                        return
+                    if is_cam:
+                        time.sleep(0.03)
+                    yield ts, None
+                    continue
+                fails = 0
+                yield ts, frame
+        finally:
+            cap.release()
+    return gen()
+
+
+def analyse(args, stop):
+    """Pass 1: frames -> per-frame features. Returns (series, stats, observed_s) or None."""
+    import cv2
+    import mediapipe as mp
+    stats = FrameStats()
+    series = []                               # (t, Features)
+    frames = capture(args, stop)
+    if frames is None:
+        return None
+    pose = mp.solutions.pose.Pose(static_image_mode=False, model_complexity=args.model_complexity,
+                                  smooth_landmarks=True, min_detection_confidence=0.5,
+                                  min_tracking_confidence=0.5)
+    last_t, preview_ok = 0.0, args.preview
+    try:
+        for ts, frame in frames:
+            last_t = ts
+            stats.attempted += 1
+            if frame is None:
+                stats.read_failed += 1
+                continue
+            if getattr(frame, "ndim", 0) != 3 or frame.shape[0] < 16 or frame.shape[1] < 16:
+                stats.corrupt += 1
+                continue
+            try:
+                h, w = frame.shape[:2]
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb.flags.writeable = False
+                res = pose.process(rgb)
+                feat = None
+                if res.pose_landmarks is None:
+                    stats.no_person += 1
+                else:
+                    lm = res.pose_landmarks.landmark
+                    if (min(lm[L_SHOULDER].visibility, lm[R_SHOULDER].visibility) < MIN_SHOULDER_VIS
+                            or min(lm[L_EAR].visibility, lm[R_EAR].visibility) < MIN_EAR_VIS):
+                        stats.low_visibility += 1
+                    else:
+                        feat = compute_features(lm, w, h)
+                        if feat is None:
+                            stats.corrupt += 1
+                        else:
+                            stats.valid += 1
+                            series.append((ts, feat))
+            except Exception as e:             # never let one bad frame kill the run
+                stats.errors += 1
+                feat = None
+                if stats.errors <= 3:
+                    print(f"posture_monitor: frame error ignored: {e!r}", file=sys.stderr)
+            if preview_ok:
+                try:
+                    txt = (f"tilt {feat.tilt_deg:.1f} lat {feat.lateral:.2f} neck {feat.neck_ratio:.2f}"
+                           if feat else "no usable pose")
+                    cv2.putText(frame, txt, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    cv2.imshow("posture", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        stop["flag"] = True
+                except cv2.error:
+                    preview_ok = False
+                    print("posture_monitor: no display available, preview disabled", file=sys.stderr)
+    finally:
+        pose.close()
+        if args.preview:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+    return series, stats, last_t
+
+
+def calibrate(series, args):
+    """Personal upright baseline = median neck_ratio over the first calib window
+    of valid data. Returns (baseline, info)."""
+    if args.baseline_neck:
+        return args.baseline_neck, {"source": "cli", "baseline_neck_ratio": args.baseline_neck}
+    t0 = series[0][0]
+    win = [f.neck_ratio for t, f in series if t - t0 <= args.calib_seconds]
+    med = statistics.median(win)
+    spread = (_pct(win, 90) - _pct(win, 10)) / med
+    return med, {"source": "first_valid_seconds", "window_s": args.calib_seconds,
+                 "frames": len(win), "baseline_neck_ratio": round(med, 4),
+                 "relative_spread_p10_p90": round(spread, 3)}
+
+
+def run(args) -> int:
+    stop = {"flag": False}
+    signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("flag", True))
+    signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__("flag", True))
+    out = analyse(args, stop)
+    if out is None:
+        return fail(args, EXIT_NO_SOURCE, "cannot open source")
+    series, stats, observed = out
+    if stats.attempted == 0 or stats.attempted == stats.read_failed:
+        return fail(args, EXIT_NO_FRAMES, "source opened but no frame could be decoded", stats)
+    cfg = Config()
+    valid_span = (series[-1][0] - series[0][0]) if len(series) > 1 else 0.0
+    # coverage = share of the observed timeline that had a usable person
+    coverage = (stats.valid / stats.attempted) if stats.attempted else 0.0
+    if len(series) < 5 or coverage < args.min_coverage or valid_span < 2.0:
+        return fail(args, EXIT_NO_PERSON,
+                    f"no usable person in frame (coverage {coverage:.0%}, need {args.min_coverage:.0%})",
+                    stats, {"coverage": round(coverage, 3)})
+
+    base, calib = calibrate(series, args)
+    st = Stabiliser(cfg, base)
+    for t, f in series:
+        st.update(t, f)
+    summ = summarise(st.samples, observed, cfg)
+
+    warnings = []
+    if calib.get("relative_spread_p10_p90", 0) > 0.15:
+        warnings.append("calibration window was unsteady; baseline may be unreliable")
+    first = series[0][1]
+    if first.tilt_deg > cfg.tilt_enter or first.lateral > cfg.lateral_enter:
+        warnings.append("person was already tilted/leaning at the start; baseline may include bad posture")
+    if stats.errors:
+        warnings.append(f"{stats.errors} frames raised errors and were skipped")
+    if stop["flag"]:
+        warnings.append("interrupted early; summary covers the observed part only")
+
+    feats = {k: {"p5": _pct([getattr(f, k) for _, f in series], 5),
+                 "p50": _pct([getattr(f, k) for _, f in series], 50),
+                 "p95": _pct([getattr(f, k) for _, f in series], 95)}
+             for k in ("tilt_deg", "lateral", "neck_ratio")}
+    body = {
+        "schema_version": 1, "status": "ok", "source": args.source,
+        "observed_seconds": round(observed, 2), "coverage": round(coverage, 3),
+        "score": summ.pop("score"),
+        "posture": {k: summ[k] for k in ("good_seconds", "bad_seconds", "unknown_seconds", "good_pct", "bad_pct")},
+        "breaks": summ["breaks"], "episodes": summ["episodes"],
+        "frames": asdict(stats), "calibration": calib,
+        "thresholds": asdict(cfg), "feature_percentiles": feats, "warnings": warnings,
+    }
+    write_json(args.out, body)
+    if args.dump_features:
+        with open(args.dump_features, "w") as fh:
+            fh.write("t,tilt_deg,lateral,neck_ratio\n")
+            for t, f in series:
+                fh.write(f"{t:.3f},{f.tilt_deg:.3f},{f.lateral:.4f},{f.neck_ratio:.4f}\n")
+    print(f"posture_monitor: score={body['score']} good={body['posture']['good_pct']}% "
+          f"breaks={body['breaks']['count']} -> {args.out}")
+    return EXIT_OK
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    try:
+        return run(args)
+    except Exception as e:
+        return fail(args, EXIT_ERROR, f"unexpected error: {e!r}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
