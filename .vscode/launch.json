@@ -1,0 +1,24 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Posture monitor (webcam, 45 s, preview)",
+      "type": "debugpy", "request": "launch", "program": "${workspaceFolder}/posture_monitor.py",
+      "args": ["--source", "0", "--duration", "45", "--out", "posture.json",
+               "--dump-features", "features.csv", "--preview"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Posture monitor (video file)",
+      "type": "debugpy", "request": "launch", "program": "${workspaceFolder}/posture_monitor.py",
+      "args": ["--source", "${input:videoPath}", "--duration", "60", "--out", "posture.json"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Unit tests",
+      "type": "debugpy", "request": "launch", "program": "${workspaceFolder}/tests/test_stabiliser.py",
+      "console": "integratedTerminal"
+    }
+  ],
+  "inputs": [{"id": "videoPath", "type": "promptString", "description": "Path to video file"}]
+}
