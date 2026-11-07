@@ -52,3 +52,24 @@ def compute_features(lm, w: int, h: int) -> Features | None:
     if not all(math.isfinite(v) for v in vals.__dict__.values()):
         return None
     return vals
+
+
+# --------------------------------------------------------------------------
+# Thresholds (see README for how these were chosen)
+# --------------------------------------------------------------------------
+@dataclass
+class Config:
+    # enter-bad / exit-bad (hysteresis: exit is stricter than enter)
+    tilt_enter: float = 8.0      # degrees
+    tilt_exit: float = 5.0
+    lateral_enter: float = 0.30  # fraction of shoulder width
+    lateral_exit: float = 0.20
+    drop_enter: float = 0.12     # neck_ratio fell >12% below personal baseline
+    drop_exit: float = 0.07
+
+
+def naive_is_bad(f: Features, baseline_neck: float, c: Config) -> bool:
+    """Per-frame verdict with a single hard line per metric. Kept for the
+    tests (to quantify flicker) and as the input to the stabiliser."""
+    drop = 1.0 - f.neck_ratio / baseline_neck
+    return f.tilt_deg > c.tilt_enter or f.lateral > c.lateral_enter or drop > c.drop_enter
