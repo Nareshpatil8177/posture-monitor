@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
-"""Seated posture monitor (work in progress: feature extraction only)."""
+"""Seated posture monitor.
+
+Reads a webcam or video file, tracks shoulders/ears with MediaPipe Pose,
+stabilises a per-frame good/bad verdict over time, and writes a JSON summary.
+
+Exit codes: 0 usable observation | 2 source cannot be opened |
+            3 source opened but no frame could be decoded |
+            4 nobody (or too little of anybody) in frame | 1 unexpected error
+"""
 from __future__ import annotations
 
+import argparse
+import json
 import math
-from dataclasses import dataclass
+import os
+import signal
+import statistics
+import sys
+import time
+from dataclasses import asdict, dataclass, field
 
 # MediaPipe Pose landmark indices
 L_EAR, R_EAR, L_SHOULDER, R_SHOULDER = 7, 8, 11, 12
@@ -155,3 +170,55 @@ class Stabiliser:
                     s[1] = raw
                 self.cand = None
         return self.committed
+
+
+# --------------------------------------------------------------------------
+# Summary
+# --------------------------------------------------------------------------
+def _pct(vals, q):
+    if not vals:
+        return None
+    v = sorted(vals)
+    k = (len(v) - 1) * q / 100
+    lo, hi = int(math.floor(k)), int(math.ceil(k))
+    return round(v[lo] + (v[hi] - v[lo]) * (k - lo), 4)
+
+
+def summarise(samples, observed_s, cfg: Config) -> dict:
+    """samples: [[t, state], ...] over *valid* frames only."""
+    good = bad = 0.0
+    runs = []                      # [state, start, end]
+    for i, (t, st) in enumerate(samples):
+        nxt = samples[i + 1][0] if i + 1 < len(samples) else t
+        dt = nxt - t
+        contiguous = dt <= cfg.max_gap_s
+        span = dt if contiguous else 0.0
+        if st == GOOD:
+            good += span
+        else:
+            bad += span
+        if runs and runs[-1][0] == st and runs[-1][2] >= t - 1e-9:
+            runs[-1][2] = t + span
+        else:
+            runs.append([st, t, t + span])
+    valid = good + bad
+    breaks = sum(1 for a, b in zip(runs, runs[1:]) if a[0] == GOOD and b[0] == BAD)
+    bad_runs = [r[2] - r[1] for r in runs if r[0] == BAD]
+    good_runs = [r[2] - r[1] for r in runs if r[0] == GOOD]
+    good_frac = good / valid if valid > 0 else 0.0
+    per_min = breaks / (valid / 60) if valid > 0 else 0.0
+    score = max(0.0, min(100.0, 100 * good_frac - min(20.0, 4.0 * per_min)))
+    r = lambda x: round(x, 2)
+    return {
+        "good_seconds": r(good), "bad_seconds": r(bad),
+        "unknown_seconds": r(max(0.0, observed_s - valid)),
+        "good_pct": r(100 * good_frac), "bad_pct": r(100 * (1 - good_frac)) if valid else 0.0,
+        "breaks": {
+            "count": breaks, "per_minute": r(per_min),
+            "mean_bad_episode_s": r(statistics.mean(bad_runs)) if bad_runs else 0.0,
+            "longest_bad_s": r(max(bad_runs)) if bad_runs else 0.0,
+            "longest_good_s": r(max(good_runs)) if good_runs else 0.0,
+        },
+        "score": round(score),
+        "episodes": [{"state": s_, "start_s": r(a), "end_s": r(b)} for s_, a, b in runs],
+    }
