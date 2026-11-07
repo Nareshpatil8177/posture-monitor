@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "source": "/tmp/ex.mp4",
+  "observed_seconds": 44.93,
+  "coverage": 0.991,
+  "score": 45,
+  "posture": {
+    "good_seconds": 22.8,
+    "bad_seconds": 22.13,
+    "unknown_seconds": 0.0,
+    "good_pct": 50.74,
+    "bad_pct": 49.26
+  },
+  "breaks": {
+    "count": 1,
+    "per_minute": 1.34,
+    "mean_bad_episode_s": 22.13,
+    "longest_bad_s": 22.13,
+    "longest_good_s": 22.8
+  },
+  "episodes": [
+    {
+      "state": "good",
+      "start_s": 0.0,
+      "end_s": 22.8
+    },
+    {
+      "state": "bad",
+      "start_s": 22.8,
+      "end_s": 44.93
+    }
+  ],
+  "frames": {
+    "attempted": 675,
+    "read_failed": 0,
+    "corrupt": 0,
+    "errors": 0,
+    "no_person": 6,
+    "low_visibility": 0,
+    "valid": 669
+  },
+  "calibration": {
+    "source": "first_valid_seconds",
+    "window_s": 8.0,
+    "frames": 120,
+    "baseline_tilt_deg": 1.73,
+    "baseline_lateral": 0.1087,
+    "baseline_neck_ratio": 0.6658,
+    "neck_spread_p10_p90": 0.046,
+    "tilt_sd_deg": 1.41
+  },
+  "thresholds": {
+    "tilt_enter": 8.0,
+    "tilt_exit": 5.0,
+    "lateral_enter": 0.3,
+    "lateral_exit": 0.2,
+    "drop_enter": 0.12,
+    "drop_exit": 0.07,
+    "ema_tau_s": 0.6,
+    "dwell_bad_s": 2.0,
+    "dwell_good_s": 1.0,
+    "max_gap_s": 1.0
+  },
+  "feature_percentiles": {
+    "tilt_deg": {
+      "p5": 0.9128,
+      "p50": 8.3463,
+      "p95": 27.3844
+    },
+    "lateral": {
+      "p5": 0.1012,
+      "p50": 0.1221,
+      "p95": 0.4161
+    },
+    "neck_ratio": {
+      "p5": 0.6383,
+      "p50": 0.6629,
+      "p95": 0.6805
+    }
+  },
+  "warnings": [],
+  "NOTE": "SYNTHETIC: built from a still portrait by tests/make_synthetic_video.py. NOT a real recording. Record your own and save as posture.json."
+}
